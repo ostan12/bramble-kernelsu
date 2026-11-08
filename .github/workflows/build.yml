@@ -1,4 +1,4 @@
-name: Build KernelSU-Next Kernel (bramble LOS24)
+name: Build KernelSU-Next Legacy (bramble LOS24)
 
 on:
   workflow_dispatch:
@@ -25,10 +25,14 @@ jobs:
           git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r487747c.git clang
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
 
-      - name: Integrate KernelSU-Next & Manual Hooks
+      - name: Integrate KernelSU-Next (legacy) & Manual Hooks
         run: |
           cd work/kernel
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+
+          echo "=== Prüfe KernelSU-Next Branch & Signatur ==="
+          git -C KernelSU branch -a || true
+          grep -E "EXPECTED_SIZE|EXPECTED_HASH|NEXT_" drivers/kernelsu/apk_sign.c || true
 
           python3 - << 'PYEOF'
           import re, subprocess
@@ -49,7 +53,16 @@ jobs:
               else:
                   print(f"[WARN] Muster in {path} nicht gefunden!")
 
-          # 1. kernel/reboot.c
+          # 1. kernel/sys.c -> ksu_handle_prctl (Manager-Erkennung im legacy-Branch)
+          def patch_prctl(c):
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5);\n#endif\n\n"
+              c = re.sub(r'(SYSCALL_DEFINE5\(prctl,)', decl + r'\1', c, count=1)
+              c = re.sub(r'(SYSCALL_DEFINE5\(prctl,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_prctl(option, arg2, arg3, arg4, arg5);\n#endif\n', c, count=1)
+              return c
+          patch_file("kernel/sys.c", "ksu_handle_prctl", patch_prctl)
+
+          # 2. kernel/reboot.c -> ksu_handle_sys_reboot (falls zusätzlich genutzt)
           def patch_reboot(c):
               decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
               c = re.sub(r'(SYSCALL_DEFINE4\(reboot,)', decl + r'\1', c, count=1)
@@ -58,7 +71,7 @@ jobs:
               return c
           patch_file("kernel/reboot.c", "ksu_handle_sys_reboot", patch_reboot)
 
-          # 2. fs/exec.c
+          # 3. fs/exec.c -> ksu_handle_execveat
           def patch_exec(c):
               has_hook_flag = "ksu_execveat_hook" in ksu_syms
               has_sucompat = "ksu_handle_execveat_sucompat" in ksu_syms
@@ -80,7 +93,7 @@ jobs:
               return c
           patch_file("fs/exec.c", "ksu_handle_execveat", patch_exec)
 
-          # 3. fs/open.c
+          # 4. fs/open.c -> ksu_handle_faccessat
           def patch_open(c):
               decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n\n"
               c = re.sub(r'(long do_faccessat\()', decl + r'\1', c, count=1)
@@ -89,7 +102,7 @@ jobs:
               return c
           patch_file("fs/open.c", "ksu_handle_faccessat", patch_open)
 
-          # 4. fs/stat.c
+          # 5. fs/stat.c -> ksu_handle_stat
           def patch_stat(c):
               decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n\n"
               c = re.sub(r'(int vfs_statx\()', decl + r'\1', c, count=1)
@@ -98,7 +111,7 @@ jobs:
               return c
           patch_file("fs/stat.c", "ksu_handle_stat", patch_stat)
 
-          # 5. fs/read_write.c
+          # 6. fs/read_write.c -> ksu_handle_vfs_read
           def patch_rw(c):
               has_read_flag = "ksu_vfs_read_hook" in ksu_syms
               decl = "#ifdef CONFIG_KSU\n"
@@ -113,28 +126,19 @@ jobs:
               c = re.sub(r'(ssize_t vfs_read\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)', r'\1' + hook, c, count=1)
               return c
           patch_file("fs/read_write.c", "ksu_handle_vfs_read", patch_rw)
-
-          # 6. kernel/sys.c (falls in dieser KernelSU-Next-Version vorhanden)
-          def patch_sys(c):
-              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n"
-              c = re.sub(r'(long __sys_setresuid\()', decl + r'\1', c, count=1)
-              c = re.sub(r'(long __sys_setresuid\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
-                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n', c, count=1)
-              return c
-          patch_file("kernel/sys.c", "ksu_handle_setresuid", patch_sys)
           PYEOF
 
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KSU=y" \
-            "CONFIG_KSU_MANUAL_HOOK=y" \
             "CONFIG_KALLSYMS=y" \
-            "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
+            "CONFIG_KALLSYMS_ALL=y" \
+            "# CONFIG_KSU_KPROBES_HOOK is not set" >> "$DEFCONFIG"
 
           git config user.email "builder@local"
           git config user.name "builder"
           git add -A
-          git commit -m "Integrate KernelSU-Next" || true
+          git commit -m "Integrate KernelSU-Next legacy with manual hooks" || true
 
       - name: Compile Kernel (Image.lz4)
         run: |
@@ -147,6 +151,14 @@ jobs:
           make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
+
+          ./scripts/config --file out/.config -e KSU -e KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -e KALLSYMS -e KALLSYMS_ALL
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            olddefconfig
+
+          echo "=== Aktive KSU-Konfiguration ==="
+          grep -E "CONFIG_KSU|CONFIG_KALLSYMS" out/.config || true
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
