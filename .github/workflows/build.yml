@@ -1,4 +1,4 @@
-name: Build Clean APatch-Ready Kernel (bramble LOS24)
+name: Build Ready-to-Flash APatch Kernel (bramble LOS24)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: 'LineageOS Kernel Branch (z.B. lineage-24.0 oder lineage-23.2)'
         required: true
         default: 'lineage-24.0'
+      superkey:
+        description: 'Dein APatch SuperKey (mind. 8 Zeichen, Buchstaben + Zahlen)'
+        required: true
+        default: 'bastiolli#'
 
 jobs:
   build:
@@ -18,22 +22,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev make zip unzip python3 cpio libelf-dev dwarves git curl lz4 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone LineageOS redbull kernel & Toolchain
+      - name: Clone LineageOS redbull kernel, Toolchain & KernelPatch tools
         run: |
-          mkdir -p work && cd work
+          mkdir -p work/kp && cd work
           git clone --depth=1 -b ${{ github.event.inputs.branch }} https://github.com/LineageOS/android_kernel_google_redbull.git kernel
           git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r487747c.git clang
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
 
-      - name: Enable KALLSYMS_ALL for APatch
+          cd kp
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/bmax121/KernelPatch/releases/latest)
+          KPTOOLS_URL=$(echo "$RELEASE_JSON" | python3 -c 'import sys, json; assets = json.load(sys.stdin)["assets"]; print(next(a["browser_download_url"] for a in assets if "kptools" in a["name"] and "linux" in a["name"]))')
+          KPIMG_URL=$(echo "$RELEASE_JSON" | python3 -c 'import sys, json; assets = json.load(sys.stdin)["assets"]; print(next(a["browser_download_url"] for a in assets if "kpimg" in a["name"] and "android" in a["name"]))')
+          curl -fL "$KPTOOLS_URL" -o kptools
+          curl -fL "$KPIMG_URL" -o kpimg
+          chmod +x kptools
+
+      - name: Configure Kernel for APatch (KALLSYMS_ALL + Disable CFI)
         run: |
           cd work/kernel
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KALLSYMS=y" \
-            "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
+            "CONFIG_KALLSYMS_ALL=y" \
+            "# CONFIG_CFI_CLANG is not set" \
+            "# CONFIG_CFI is not set" \
+            "# CONFIG_CFI_PERMISSIVE is not set" >> "$DEFCONFIG"
 
-      - name: Compile Kernel (Image.lz4)
+      - name: Compile Kernel (Image)
         run: |
           set -o pipefail
           cd work/kernel
@@ -45,34 +60,38 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
-          ./scripts/config --file out/.config -e KALLSYMS -e KALLSYMS_ALL
+          ./scripts/config --file out/.config -e KALLSYMS -e KALLSYMS_ALL -d CFI_CLANG -d CFI -d CFI_PERMISSIVE
           make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
           make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            KCFLAGS="-Wno-error" DTC_FLAGS="-f" Image.lz4
+            KCFLAGS="-Wno-error" DTC_FLAGS="-f" Image
 
-      - name: Package AnyKernel3
+      - name: Patch Image with KernelPatch (APatch) & Package AnyKernel3
+        env:
+          SUPERKEY: ${{ github.event.inputs.superkey }}
         run: |
           cd work
-          for img in Image.lz4-dtb Image.lz4 Image.gz-dtb Image.gz Image; do
-            if [ -f "kernel/out/arch/arm64/boot/$img" ]; then
-              cp "kernel/out/arch/arm64/boot/$img" AnyKernel3/
-              break
-            fi
-          done
+          ./kp/kptools -p -i kernel/out/arch/arm64/boot/Image -k kp/kpimg -s "$SUPERKEY" -o Image_patched
+
+          # Im Linux-4.19-Legacy-LZ4-Format komprimieren
+          python3 -c '
+          import struct, sys
+          data = open("Image_patched", "rb").read()
+          sys.stdout.buffer.write(data + struct.pack("<I", len(data)))
+          ' | lz4 -l -f - AnyKernel3/Image.lz4
 
           cd AnyKernel3
           sed -i 's/device.name1=maguro/device.name1=bramble/' anykernel.sh
           sed -i 's/device.name2=toro/device.name2=redfin/' anykernel.sh
           sed -i 's|BLOCK=.*;|BLOCK=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
           sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/' anykernel.sh
-          zip -r9 "$GITHUB_WORKSPACE/APatch-Ready-bramble.zip" * -x .git README.md *placeholder
+          zip -r9 "$GITHUB_WORKSPACE/APatch-bramble.zip" * -x .git README.md *placeholder
 
-      - name: Upload Kernel ZIP
+      - name: Upload Ready-to-Flash Kernel ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: APatch-Ready-bramble
-          path: APatch-Ready-bramble.zip
+          name: APatch-bramble
+          path: APatch-bramble.zip
