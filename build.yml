@@ -1,0 +1,180 @@
+name: Build KernelSU-Next Kernel (bramble LOS24)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'LineageOS Kernel Branch (z.B. lineage-24.0 oder lineage-23.2)'
+        required: true
+        default: 'lineage-24.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Free up disk space & install dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev make zip unzip python3 cpio libelf-dev dwarves git curl lz4 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clone LineageOS redbull kernel & Toolchain
+        run: |
+          mkdir -p work && cd work
+          git clone --depth=1 -b ${{ github.event.inputs.branch }} https://github.com/LineageOS/android_kernel_google_redbull.git kernel
+          git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r487747c.git clang
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+
+      - name: Integrate KernelSU-Next & Manual Hooks
+        run: |
+          cd work/kernel
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+
+          python3 - << 'PYEOF'
+          import re, subprocess
+
+          ksu_syms = subprocess.check_output(["grep", "-rn", "ksu_", "drivers/kernelsu/"], text=True)
+
+          def patch_file(path, check_sym, patch_fn):
+              if check_sym not in ksu_syms:
+                  print(f"[SKIP] {path}: {check_sym} nicht benötigt")
+                  return
+              with open(path, "r") as f:
+                  content = f.read()
+              new_content = patch_fn(content)
+              if new_content != content:
+                  with open(path, "w") as f:
+                      f.write(new_content)
+                  print(f"[OK] {path} gepatcht ({check_sym})")
+              else:
+                  print(f"[WARN] Muster in {path} nicht gefunden!")
+
+          # 1. kernel/reboot.c
+          def patch_reboot(c):
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
+              c = re.sub(r'(SYSCALL_DEFINE4\(reboot,)', decl + r'\1', c, count=1)
+              c = re.sub(r'(SYSCALL_DEFINE4\(reboot,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n', c, count=1)
+              return c
+          patch_file("kernel/reboot.c", "ksu_handle_sys_reboot", patch_reboot)
+
+          # 2. fs/exec.c
+          def patch_exec(c):
+              has_hook_flag = "ksu_execveat_hook" in ksu_syms
+              has_sucompat = "ksu_handle_execveat_sucompat" in ksu_syms
+              decl = "#ifdef CONFIG_KSU\nstruct filename;\n"
+              if has_hook_flag:
+                  decl += "extern bool ksu_execveat_hook __read_mostly;\n"
+              decl += "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+              if has_sucompat:
+                  decl += "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+              decl += "#endif\n"
+
+              c = re.sub(r'(#include\s*[<"][^>"]+[>"])', r'\1\n' + decl, c, count=1)
+
+              if has_hook_flag and has_sucompat:
+                  hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
+              else:
+                  hook = "#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
+              c = re.sub(r'(if \(IS_ERR\(filename\)\))', hook + r'\1', c, count=1)
+              return c
+          patch_file("fs/exec.c", "ksu_handle_execveat", patch_exec)
+
+          # 3. fs/open.c
+          def patch_open(c):
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n\n"
+              c = re.sub(r'(long do_faccessat\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(long do_faccessat\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n', c, count=1)
+              return c
+          patch_file("fs/open.c", "ksu_handle_faccessat", patch_open)
+
+          # 4. fs/stat.c
+          def patch_stat(c):
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n\n"
+              c = re.sub(r'(int vfs_statx\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', c, count=1)
+              return c
+          patch_file("fs/stat.c", "ksu_handle_stat", patch_stat)
+
+          # 5. fs/read_write.c
+          def patch_rw(c):
+              has_read_flag = "ksu_vfs_read_hook" in ksu_syms
+              decl = "#ifdef CONFIG_KSU\n"
+              if has_read_flag:
+                  decl += "extern bool ksu_vfs_read_hook __read_mostly;\n"
+              decl += "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif\n\n"
+              c = re.sub(r'(ssize_t vfs_read\()', decl + r'\1', c, count=1)
+              if has_read_flag:
+                  hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n"
+              else:
+                  hook = "#ifdef CONFIG_KSU\n\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n"
+              c = re.sub(r'(ssize_t vfs_read\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)', r'\1' + hook, c, count=1)
+              return c
+          patch_file("fs/read_write.c", "ksu_handle_vfs_read", patch_rw)
+
+          # 6. kernel/sys.c (falls in dieser KernelSU-Next-Version vorhanden)
+          def patch_sys(c):
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n"
+              c = re.sub(r'(long __sys_setresuid\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(long __sys_setresuid\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n', c, count=1)
+              return c
+          patch_file("kernel/sys.c", "ksu_handle_setresuid", patch_sys)
+          PYEOF
+
+          DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
+          printf '%s\n' \
+            "CONFIG_KSU=y" \
+            "CONFIG_KSU_MANUAL_HOOK=y" \
+            "CONFIG_KALLSYMS=y" \
+            "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
+
+          git config user.email "builder@local"
+          git config user.name "builder"
+          git add -A
+          git commit -m "Integrate KernelSU-Next" || true
+
+      - name: Compile Kernel (Image.lz4)
+        run: |
+          set -o pipefail
+          cd work/kernel
+          export PATH="$GITHUB_WORKSPACE/work/clang/bin:$PATH"
+          DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
+          DEFCONFIG_REL=${DEFCONFIG#arch/arm64/configs/}
+
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            "$DEFCONFIG_REL"
+
+          if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KCFLAGS="-Wno-error" DTC_FLAGS="-f" Image.lz4 2>&1 | tee build.log; then
+            echo "=== FEHLER IM BUILD-LOG ==="
+            grep -iE "error:|ERROR \(|undefined reference|fatal error|No rule to make" build.log | tail -n 30
+            exit 1
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          cd work
+          for img in Image.lz4-dtb Image.lz4 Image.gz-dtb Image.gz Image; do
+            if [ -f "kernel/out/arch/arm64/boot/$img" ]; then
+              cp "kernel/out/arch/arm64/boot/$img" AnyKernel3/
+              break
+            fi
+          done
+
+          cd AnyKernel3
+          sed -i 's/device.name1=maguro/device.name1=bramble/' anykernel.sh
+          sed -i 's/device.name2=toro/device.name2=redfin/' anykernel.sh
+          sed -i 's|BLOCK=.*;|BLOCK=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/' anykernel.sh
+          zip -r9 "$GITHUB_WORKSPACE/KernelSU-Next-bramble.zip" * -x .git README.md *placeholder
+
+      - name: Upload Kernel ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-bramble
+          path: KernelSU-Next-bramble.zip
