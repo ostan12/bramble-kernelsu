@@ -10,11 +10,11 @@ on:
       superkey:
         description: 'Dein APatch SuperKey (mind. 8 Zeichen, Buchstaben + Zahlen)'
         required: true
-        default: 'bastiolli#'
+        default: 'BrambleRoot2026'
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Free up disk space & install dependencies
         run: |
@@ -36,6 +36,7 @@ jobs:
           curl -fL "$KPTOOLS_URL" -o kptools
           curl -fL "$KPIMG_URL" -o kpimg
           chmod +x kptools
+          ./kptools -v
 
       - name: Configure Kernel for APatch (KALLSYMS_ALL + Disable CFI)
         run: |
